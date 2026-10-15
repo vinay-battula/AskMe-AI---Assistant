@@ -49,40 +49,69 @@ def ask_ollama(agent_name, instructions, prompt, max_tokens=AGENT_TOKENS):
 # FAST CHAT WITH CONVERSATION HISTORY
 # ==================================================
 
-def quick_answer(question, history=None):
-    """Answer the current question using previous messages."""
 
+import ollama
+
+MODEL = "llama3.2:latest"  # Use the exact name from: ollama list
+
+
+def quick_answer(question, history=None):
     messages = [
         {
             "role": "system",
-            "content": (
-                "You must answer the exact question asked. "
-                "If the user asks for code or a programming solution, "
-                "always provide the complete, runnable code first, "
-                "followed by a short explanation if useful. "
-                "Never answer a different topic."
-            ),
+            "content": """
+You are AskMe AI, a helpful programming and general-purpose assistant.
+
+IMPORTANT RULES:
+1. Answer the exact question the user asks.
+2. Always provide complete answers. Never intentionally stop halfway.
+3. When asked for code, provide a complete, runnable program.
+4. Include all required imports, the class, the main method,
+   all closing braces, and any required statements.
+5. Put the complete code first, then a short explanation.
+6. For Java programs, include the complete class and main method.
+7. Do not replace the end of a program with "..." or omit code.
+8. Use Markdown code fences with the correct programming language.
+9. If an answer needs to be long, finish the code before explaining it.
+10. For follow-up questions, use the conversation history.
+"""
         }
     ]
 
     if isinstance(history, list):
-        # Include only recent, valid messages.
-        for item in history[-8:]:
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role")
-            content = item.get("content", "")
-
+        for item in history[-6:]:
             if (
-                role in ("user", "assistant")
-                and isinstance(content, str)
-                and content.strip()
+                isinstance(item, dict)
+                and item.get("role") in ("user", "assistant")
+                and isinstance(item.get("content"), str)
             ):
                 messages.append({
-                    "role": role,
-                    "content": content[:1200],
+                    "role": item["role"],
+                    "content": item["content"][:2000]
                 })
+
+    messages.append({
+        "role": "user",
+        "content": question
+    })
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=messages,
+        options={
+            "num_predict": 1200,
+            "num_ctx": 4096,
+            "temperature": 0.2
+        },
+        keep_alive=-1
+    )
+
+    answer = response.message.content.strip()
+
+    if not answer:
+        raise RuntimeError("The AI returned an empty answer.")
+
+    return answer
 
     # The current question is sent separately.
     messages.append({"role": "user", "content": question})
