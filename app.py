@@ -1,4 +1,5 @@
-import re
+
+import os
 from pathlib import Path
 
 from flask import (
@@ -22,24 +23,27 @@ from main import (
     REPORTS_DIR,
 )
 
+
+# ==================================================
+# APP CONFIGURATION
+# ==================================================
+
 app = Flask(__name__)
 
-# Your published GitHub Pages frontend.
 FRONTEND_ORIGIN = "https://vinay-battula.github.io"
+MAX_MESSAGE_LENGTH = 2000
+MAX_CONVERSATION_ID_LENGTH = 100
 
 
 # ==================================================
-# CORS: ALLOW YOUR GITHUB PAGES FRONTEND
+# CORS: GITHUB PAGES FRONTEND
 # ==================================================
 
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "")
 
-    if (
-        origin == FRONTEND_ORIGIN
-        or origin == FRONTEND_ORIGIN + "/"
-    ):
+    if origin == FRONTEND_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Headers"] = (
@@ -56,7 +60,7 @@ def add_cors_headers(response):
 # HOME PAGE
 # ==================================================
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
     return render_template("index.html")
 
@@ -71,33 +75,50 @@ def health():
         "status": "ok",
         "application": "AskMe AI",
         "message": "The Flask backend is running.",
-    })
+    }), 200
 
 
 # ==================================================
-# FAST CHAT ENDPOINT
+# VALIDATE REQUEST MESSAGE
+# ==================================================
+
+def validate_message(data, field_name="message"):
+    if not isinstance(data, dict):
+        return None, "Invalid request data."
+
+    message = data.get(field_name, "")
+
+    if not isinstance(message, str):
+        return None, "Message must be text."
+
+    message = message.strip()
+
+    if not message:
+        return None, "Please enter a message."
+
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return None, (
+            f"Message must be under "
+            f"{MAX_MESSAGE_LENGTH} characters."
+        )
+
+    return message, None
+
+
+# ==================================================
+# CHAT ENDPOINT
 # ==================================================
 
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
 
-    message = data.get("message", "")
-    history = data.get("history", [])
+    message, error = validate_message(data)
+
+    if error:
+        return jsonify({"error": error}), 400
+
     conversation_id = data.get("conversation_id", "default")
-
-    if not isinstance(message, str):
-        return jsonify({"error": "Message must be text."}), 400
-
-    message = message.strip()
-
-    if not message:
-        return jsonify({"error": "Please enter a question."}), 400
-
-    if len(message) > 2000:
-        return jsonify({
-            "error": "Keep your question under 2000 characters."
-        }), 400
 
     if not isinstance(conversation_id, str):
         return jsonify({
@@ -106,29 +127,54 @@ def chat():
 
     conversation_id = conversation_id.strip()
 
-    if not conversation_id or len(conversation_id) > 100:
+    if (
+        not conversation_id
+        or len(conversation_id) > MAX_CONVERSATION_ID_LENGTH
+    ):
         return jsonify({
             "error": "Conversation ID must contain 1–100 characters."
         }), 400
 
+    history = data.get("history", [])
+
     if not isinstance(history, list):
         history = []
 
+    # Accept only recent, valid chat messages.
     history = [
-        item for item in history[-8:]
+        {
+            "role": item["role"],
+            "content": item["content"],
+        }
+        for item in history[-8:]
         if isinstance(item, dict)
         and item.get("role") in ("user", "assistant")
         and isinstance(item.get("content"), str)
+        and len(item["content"]) <= MAX_MESSAGE_LENGTH
     ]
 
     try:
-        # Save the user's question.
-        save_chat_message(conversation_id, "user", message)
+        # Store the user's message.
+        save_chat_message(
+            conversation_id,
+            "user",
+            message,
+        )
 
+        # Generate the response using Ollama.
         answer = quick_answer(message, history)
 
-        # Save the AI's response.
-        save_chat_message(conversation_id, "assistant", answer)
+        if not isinstance(answer, str):
+            raise ValueError(
+                "The AI response must be a string."
+            )
+
+        # Store the AI response.
+        save_chat_message(
+            conversation_id,
+            "assistant",
+            answer,
+        )
 
         return jsonify({
             "reply": answer,
@@ -136,11 +182,13 @@ def chat():
         }), 200
 
     except Exception:
-        app.logger.exception("Chat failed")
+        app.logger.exception("Chat request failed")
+
         return jsonify({
             "error": (
                 "Chat failed. Check that Ollama is running, "
-                "the model is installed, and the Flask logs."
+                "your model is installed, and the Flask terminal "
+                "for error details."
             )
         }), 500
 
@@ -157,19 +205,28 @@ def conversations():
         }), 200
 
     except Exception:
-        app.logger.exception("Could not load conversations")
+        app.logger.exception(
+            "Could not load conversations"
+        )
+
         return jsonify({
             "error": "Could not load saved conversations."
         }), 500
 
 
 # ==================================================
-# LOAD A CONVERSATION
+# LOAD CONVERSATION HISTORY
 # ==================================================
 
-@app.route("/api/history/<conversation_id>", methods=["GET"])
+@app.route(
+    "/api/history/<conversation_id>",
+    methods=["GET"],
+)
 def conversation_history(conversation_id):
-    if not conversation_id or len(conversation_id) > 100:
+    if (
+        not conversation_id
+        or len(conversation_id) > MAX_CONVERSATION_ID_LENGTH
+    ):
         return jsonify({
             "error": "Invalid conversation ID."
         }), 400
@@ -183,81 +240,108 @@ def conversation_history(conversation_id):
         }), 200
 
     except Exception:
-        app.logger.exception("Could not load chat history")
+        app.logger.exception(
+            "Could not load conversation history"
+        )
+
         return jsonify({
             "error": "Could not load chat history."
         }), 500
 
 
 # ==================================================
-# THREE-AGENT RESEARCH ENDPOINT
+# MULTI-AGENT RESEARCH
 # ==================================================
 
 @app.route("/research", methods=["POST"])
 def research():
     data = request.get_json(silent=True) or {}
-    message = data.get("message", "")
 
-    if not isinstance(message, str):
-        return jsonify({"error": "Message must be text."}), 400
+    topic, error = validate_message(data)
 
-    message = message.strip()
-
-    if not message:
+    if error:
         return jsonify({
-            "error": "Please enter a research topic."
-        }), 400
-
-    if len(message) > 2000:
-        return jsonify({
-            "error": "Keep your topic under 2000 characters."
+            "error": error.replace("message", "research topic")
         }), 400
 
     try:
-        research_text, sources = researcher_agent(message)
-        analysis = analyst_agent(message, research_text)
+        # Agent 1: Researcher gathers information and sources.
+        research_text, sources = researcher_agent(topic)
 
+        # Agent 2: Analyst examines the research.
+        analysis = analyst_agent(
+            topic,
+            research_text,
+        )
+
+        # Agent 3: Writer creates the final report.
         report = writer_agent(
-            message,
+            topic,
             research_text,
             analysis,
             sources,
         )
 
-        # The updated main.py returns a dictionary of file paths.
+        # Save PDF and Markdown reports.
         saved = save_report(
-            message,
+            topic,
             research_text,
             analysis,
             report,
             sources,
         )
 
-        pdf_path = Path(saved["pdf"])
-        markdown_path = Path(saved["markdown"])
+        pdf_path = Path(saved["pdf"]).resolve()
+        markdown_path = Path(saved["markdown"]).resolve()
+        reports_dir = Path(REPORTS_DIR).resolve()
+
+        # Ensure the generated files are inside reports/.
+        if (
+            pdf_path.parent != reports_dir
+            or markdown_path.parent != reports_dir
+        ):
+            raise ValueError(
+                "Report files must be saved inside the reports directory."
+            )
+
+        if not pdf_path.is_file() or not markdown_path.is_file():
+            raise FileNotFoundError(
+                "The report files were not created successfully."
+            )
 
         return jsonify({
             "reply": report,
             "report_file": pdf_path.name,
-            "report_url": f"/download/report/{pdf_path.name}",
+            "report_url": (
+                f"/download/report/{pdf_path.name}"
+            ),
             "markdown_file": markdown_path.name,
+            "markdown_url": (
+                f"/download/report/{markdown_path.name}"
+            ),
         }), 200
 
     except Exception:
-        app.logger.exception("Research workflow failed")
+        app.logger.exception(
+            "Multi-agent research workflow failed"
+        )
+
         return jsonify({
             "error": (
                 "Research failed. Check Ollama, the installed model, "
-                "your internet connection, and the Flask logs."
+                "your internet connection, and the Flask terminal."
             )
         }), 500
 
 
 # ==================================================
-# DOWNLOAD GENERATED REPORTS
+# DOWNLOAD PDF OR MARKDOWN REPORT
 # ==================================================
 
-@app.route("/download/report/<filename>", methods=["GET"])
+@app.route(
+    "/download/report/<filename>",
+    methods=["GET"],
+)
 def download_report(filename):
     safe_name = secure_filename(filename)
 
@@ -270,28 +354,39 @@ def download_report(filename):
             "error": "Invalid report filename."
         }), 400
 
-    report_path = REPORTS_DIR / safe_name
+    reports_dir = Path(REPORTS_DIR).resolve()
+    report_path = (reports_dir / safe_name).resolve()
+
+    # Prevent access to files outside the reports directory.
+    if report_path.parent != reports_dir:
+        return jsonify({
+            "error": "Invalid report path."
+        }), 400
 
     if not report_path.is_file():
         return jsonify({
-            "error": "Report not found. Generate the report again."
+            "error": (
+                "Report not found. Please generate the report again."
+            )
         }), 404
 
     return send_from_directory(
-        str(REPORTS_DIR),
+        str(reports_dir),
         safe_name,
         as_attachment=True,
     )
 
 
 # ==================================================
-# START SERVER
+# START FLASK SERVER
 # ==================================================
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+
     app.run(
         host="0.0.0.0",
-        port=int(__import__("os").environ.get("PORT", "5000")),
+        port=port,
         debug=False,
         use_reloader=False,
     )

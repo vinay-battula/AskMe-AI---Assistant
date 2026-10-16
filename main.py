@@ -23,7 +23,7 @@ from reportlab.platypus import (
 # CONFIGURATION
 # ==================================================
 
-MODEL = "llama3.2:latest"
+MODEL = "llama3.2:1b"
 CONTEXT_SIZE = 4096
 CHAT_TOKENS = 1200
 AGENT_TOKENS = 450
