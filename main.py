@@ -1,11 +1,15 @@
+
+import os
 import re
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from dotenv import load_dotenv
 import ollama
 from ddgs import DDGS
+from supabase import create_client
+
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -17,6 +21,9 @@ from reportlab.platypus import (
     Spacer,
     HRFlowable,
 )
+
+# Load environment variables from .env
+load_dotenv()
 
 
 # ==================================================
@@ -35,95 +42,82 @@ DATABASE_PATH = PROJECT_DIR / "askme_history.db"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+
+
 # ==================================================
-# DATABASE: SAVE CHAT HISTORY
+# DATABASE: SUPABASE CHAT HISTORY
 # ==================================================
 
-def init_database():
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-        connection.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chat_conversation
-            ON chat_messages(conversation_id, id)
-        """)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "Missing SUPABASE_URL or SUPABASE_KEY environment variable."
+    )
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def save_chat_message(conversation_id, role, content):
     if role not in ("user", "assistant"):
         raise ValueError("Role must be user or assistant.")
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute(
-            """
-            INSERT INTO chat_messages
-            (conversation_id, role, content, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                str(conversation_id),
-                role,
-                content,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
+    supabase.table("chat_messages").insert({
+        "conversation_id": str(conversation_id),
+        "role": role,
+        "message": content,
+    }).execute()
 
 
 def get_chat_history(conversation_id, limit=100):
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT role, content, created_at
-            FROM chat_messages
-            WHERE conversation_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (str(conversation_id), max(1, min(int(limit), 500))),
-        ).fetchall()
+    safe_limit = max(1, min(int(limit), 500))
+
+    response = (
+        supabase.table("chat_messages")
+        .select("role, message, created_at")
+        .eq("conversation_id", str(conversation_id))
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+        .limit(safe_limit)
+        .execute()
+    )
+
+    rows = list(reversed(response.data or []))
 
     return [
         {
             "role": row["role"],
-            "content": row["content"],
+            "content": row["message"],
             "created_at": row["created_at"],
-        }
-        for row in reversed(rows)
-    ]
-
-
-def list_conversations():
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        rows = connection.execute("""
-            SELECT
-                conversation_id,
-                MAX(id) AS latest_id,
-                MAX(created_at) AS last_activity
-            FROM chat_messages
-            GROUP BY conversation_id
-            ORDER BY latest_id DESC
-        """).fetchall()
-
-    return [
-        {
-            "conversation_id": row[0],
-            "last_activity": row[2],
         }
         for row in rows
     ]
 
 
-init_database()
+def list_conversations():
+    response = (
+        supabase.table("chat_messages")
+        .select("conversation_id, created_at, id")
+        .order("id", desc=True)
+        .limit(1000)
+        .execute()
+    )
 
+    conversations = []
+    seen = set()
+
+    for row in response.data or []:
+        conversation_id = row["conversation_id"]
+
+        if conversation_id not in seen:
+            seen.add(conversation_id)
+            conversations.append({
+                "conversation_id": conversation_id,
+                "last_activity": row["created_at"],
+            })
+
+    return conversations
 
 # ==================================================
 # OLLAMA HELPER
@@ -539,16 +533,46 @@ def run_research(topic):
 # TERMINAL ENTRY POINT
 # ==================================================
 
+
 def main():
     print("\n========== ASKME AI RESEARCH ASSISTANT ==========")
+
     topic = input("Enter your research topic: ").strip()
 
     if not topic:
         print("Please enter a topic.")
         return
 
+    # Use one conversation ID for the question and its answer.
+    conversation_id = datetime.now().strftime("research_%Y%m%d_%H%M%S")
+
     try:
+        # Save the user's research question.
+        save_chat_message(
+            conversation_id,
+            "user",
+            topic
+        )
+        print("\nQuestion saved to Supabase.")
+
+        # Run the existing research workflow.
         result = run_research(topic)
+
+        # Save the completed AI response.
+        assistant_message = (
+            f"# {result['topic']}\n\n"
+            f"{result['report']}\n\n"
+            f"Markdown report: {result['markdown_path']}\n\n"
+            f"PDF report: {result['pdf_path']}"
+        )
+
+        save_chat_message(
+            conversation_id,
+            "assistant",
+            assistant_message
+        )
+
+        print("AI response saved to Supabase.")
 
         print("\n========== RESEARCH REPORT ==========")
         print(result["report"])
@@ -559,8 +583,14 @@ def main():
         print("\nPDF report:")
         print(result["pdf_path"])
 
+        print("\nConversation ID:")
+        print(conversation_id)
+
     except Exception as error:
-        print(f"\nResearch failed: {type(error).__name__}: {error}")
+        print(
+            f"\nResearch failed: "
+            f"{type(error).__name__}: {error}"
+        )
 
 
 if __name__ == "__main__":

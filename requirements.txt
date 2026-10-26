@@ -7,4 +7,5 @@ ollama
 ddgs
 reportlab
 python-dotenv
+
 supabase
