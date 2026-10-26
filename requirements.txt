@@ -1,3 +1,10 @@
 openai-agents
 python-dotenv
 gunicorn
+Flask
+gunicorn
+ollama
+ddgs
+reportlab
+python-dotenv
+supabase
